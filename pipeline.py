@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-The KPI Hub — 5-Engine Content Pipeline v3.0
-Fixed: WordPress via XML-RPC (no plugin, no REST API, works on all Hostinger installs)
-Fixed: Telegram bot token validation
+The KPI Hub — 5-Engine Content Pipeline v3.1
+Fixed: Graceful fallback when WordPress XML-RPC unavailable (static site)
+Fixed: Telegram chat ID error no longer fails the pipeline
 """
 
 import os
 import sys
+import json
 import time
 import logging
 import hashlib
@@ -14,9 +15,6 @@ import feedparser
 import requests
 from datetime import datetime, timezone
 from anthropic import Anthropic
-from wordpress_xmlrpc import Client, WordPressPost
-from wordpress_xmlrpc.methods.posts import NewPost
-from wordpress_xmlrpc.methods import posts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,9 +27,10 @@ ANTHROPIC_API_KEY  = os.environ['ANTHROPIC_API_KEY']
 SERPAPI_KEY        = os.environ['SERPAPI_KEY']
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID   = os.environ['TELEGRAM_CHAT_ID']
-WP_SITE_URL        = os.environ['WP_SITE_URL'].rstrip('/')
-WP_USERNAME        = os.environ['WP_USERNAME']
-WP_APP_PASSWORD    = os.environ['WP_APP_PASSWORD']
+WP_SITE_URL        = os.environ.get('WP_SITE_URL', '').rstrip('/')
+WP_USERNAME        = os.environ.get('WP_USERNAME', '')
+WP_APP_PASSWORD    = os.environ.get('WP_APP_PASSWORD', '')
+ALPHA_VANTAGE_KEY  = os.environ.get('ALPHA_VANTAGE_KEY', '')
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -144,32 +143,55 @@ def engine3_verify(article):
     return article
 
 # ═══════════════════════════════════════════════════════
-# ENGINE 4 — PUBLISH via XML-RPC (works on all WordPress)
+# ENGINE 4 — PUBLISH (WordPress REST API with JSON fallback)
 # ═══════════════════════════════════════════════════════
 def engine4_publish(article):
-    log.info(f'ENGINE 4: Publishing via XML-RPC → {article["slug"]}')
+    log.info(f'ENGINE 4: Publishing → {article["slug"]}')
 
-    xmlrpc_url = f'{WP_SITE_URL}/xmlrpc.php'
-    log.info(f'ENGINE 4: Connecting to {xmlrpc_url}')
+    # Try WordPress REST API first
+    if WP_SITE_URL and WP_USERNAME and WP_APP_PASSWORD:
+        rest_url = f'{WP_SITE_URL}/wp-json/wp/v2/posts'
+        log.info(f'ENGINE 4: Trying WordPress REST API → {rest_url}')
+        try:
+            resp = requests.post(
+                rest_url,
+                auth=(WP_USERNAME, WP_APP_PASSWORD),
+                json={
+                    'title':   article['title'],
+                    'content': article['content'],
+                    'excerpt': article['excerpt'],
+                    'status':  'draft',
+                    'slug':    f'{article["slug"]}-{datetime.now().strftime("%Y%m%d%H%M")}',
+                },
+                timeout=20
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                post_id = data.get('id')
+                post_url = data.get('link', f'{WP_SITE_URL}/?p={post_id}')
+                log.info(f'ENGINE 4: ✅ WordPress draft #{post_id} created')
+                return {'id': post_id, 'url': post_url, 'title': article['title'], 'method': 'wordpress'}
+            else:
+                log.warning(f'ENGINE 4: REST API returned {resp.status_code} — {resp.text[:150]}')
+        except Exception as ex:
+            log.warning(f'ENGINE 4: REST API error: {ex}')
 
-    try:
-        wp = Client(xmlrpc_url, WP_USERNAME, WP_APP_PASSWORD)
-
-        post = WordPressPost()
-        post.title   = article['title']
-        post.content = article['content']
-        post.excerpt = article['excerpt']
-        post.post_status = 'draft'
-        post.slug    = f'{article["slug"]}-{datetime.now().strftime("%Y%m%d%H%M")}'
-
-        post_id = wp.call(NewPost(post))
-        post_url = f'{WP_SITE_URL}/?p={post_id}'
-        log.info(f'ENGINE 4: ✅ Published draft #{post_id}')
-        return {'id': post_id, 'url': post_url, 'title': article['title']}
-
-    except Exception as ex:
-        log.error(f'ENGINE 4: XML-RPC failed: {ex}')
-        raise Exception(f'WordPress XML-RPC publish failed: {ex}')
+    # Fallback: save article as JSON artifact for manual review
+    log.info(f'ENGINE 4: Saving to local artifact (WordPress unavailable)')
+    os.makedirs('articles', exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = f'articles/{article["slug"]}-{ts}.json'
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump({
+            'title':     article['title'],
+            'slug':      article['slug'],
+            'content':   article['content'],
+            'excerpt':   article['excerpt'],
+            'generated': datetime.now(timezone.utc).isoformat(),
+            'status':    'pending_publish',
+        }, f, ensure_ascii=False, indent=2)
+    log.info(f'ENGINE 4: ✅ Saved to {filename} (ready for manual publish)')
+    return {'id': filename, 'url': filename, 'title': article['title'], 'method': 'artifact'}
 
 # ═══════════════════════════════════════════════════════
 # ENGINE 5 — TELEGRAM NOTIFY
@@ -177,13 +199,12 @@ def engine4_publish(article):
 def engine5_notify(published, harvest_count, errors):
     log.info('ENGINE 5: Sending Telegram notification...')
 
-    # First verify bot token is valid
     verify = requests.get(
         f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe',
         timeout=10
     )
     if verify.status_code != 200:
-        log.error(f'ENGINE 5: Bot token invalid! Response: {verify.text[:100]}')
+        log.warning(f'ENGINE 5: Bot token invalid — skipping Telegram')
         return
 
     bot_info = verify.json()
@@ -192,19 +213,20 @@ def engine5_notify(published, harvest_count, errors):
     now = datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')
     emoji = '✅' if not errors else '⚠️'
 
+    wp_count   = sum(1 for a in published if a.get('method') == 'wordpress')
+    art_count  = sum(1 for a in published if a.get('method') == 'artifact')
+
     lines = [
         f'*{emoji} KPI Hub Pipeline Complete*',
         f'`{now}`',
         f'',
-        f'📡 Signals: {harvest_count}',
-        f'📝 Articles: {len(published)}',
+        f'📡 Signals harvested: {harvest_count}',
+        f'📝 Articles generated: {len(published)}',
     ]
-
-    if published:
-        lines += ['', '*Drafts ready:*']
-        for art in published:
-            edit_url = f'{WP_SITE_URL}/wp-admin/post.php?post={art["id"]}&action=edit'
-            lines.append(f'• [{art["title"][:40]}...]({edit_url})')
+    if wp_count:
+        lines.append(f'🌐 WordPress drafts: {wp_count}')
+    if art_count:
+        lines.append(f'📦 Saved as artifacts: {art_count}')
 
     if errors:
         lines += ['', f'⚠️ Errors: {len(errors)}']
@@ -229,14 +251,14 @@ def engine5_notify(published, harvest_count, errors):
     if resp.status_code == 200:
         log.info('ENGINE 5: Telegram notification sent ✅')
     else:
-        log.error(f'ENGINE 5: Telegram failed: {resp.text[:200]}')
+        log.warning(f'ENGINE 5: Telegram failed (chat_id may be wrong): {resp.text[:200]}')
 
 # ═══════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════
 def main():
     log.info('=' * 60)
-    log.info('KPI HUB PIPELINE v3.0 — STARTING')
+    log.info('KPI HUB PIPELINE v3.1 — STARTING')
     log.info('=' * 60)
 
     start = time.time()
@@ -264,7 +286,8 @@ def main():
     log.info(f'PIPELINE COMPLETE — {len(published)}/{len(ARTICLE_TYPES)} articles | {elapsed}s')
     log.info('=' * 60)
 
-    if len(published) == 0:
+    # Only hard-fail if content generation itself failed (not publishing)
+    if len(published) == 0 and len(errors) == len(ARTICLE_TYPES):
         sys.exit(1)
 
 if __name__ == '__main__':
